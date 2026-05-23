@@ -1,0 +1,37 @@
+#===========================================
+*.parquet
+*.csv
+*.xlsx
+*.json
+data/
+raw_data/
+output/
+
+# ==========================================
+.ipynb_checkpoints/
+checkpoint/
+catboost_info/
+lightning_logs/
+*.log
+
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+bin/
+lib/
+
+# ==========================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# ==========================================
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
