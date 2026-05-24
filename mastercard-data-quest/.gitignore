@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+bin/
+lib/
+
+# Jupyter
+.ipynb_checkpoints/
+checkpoint/
+
+# Experiment outputs
+catboost_info/
+lightning_logs/
+*.log
+
+# Local secrets and OS/editor files
+.env
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
+.vscode/
+.idea/
+
+# Hackathon data and generated artifacts
+*.parquet
+*.csv
+*.xlsx
+*.json
+raw_data/
+output/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+outputs/figures/*
+!outputs/figures/.gitkeep
+outputs/metrics/*
+!outputs/metrics/.gitkeep
+outputs/models/*
+!outputs/models/.gitkeep
+outputs/predictions/*
+!outputs/predictions/.gitkeep
