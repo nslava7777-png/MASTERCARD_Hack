@@ -1,13 +1,10 @@
 """Transaction-level cleaning and merchant reference merge."""
 
 from __future__ import annotations
-
 from collections.abc import Iterable
-
 import polars as pl
 
-from src.config import CARD_ID_COLUMN, TARGET_COLUMN
-
+from src.config import CARD_ID_COLUMN
 
 TRUTHY_VALUES = {"1", "true", "t", "yes", "y"}
 FALSEY_VALUES = {"0", "false", "f", "no", "n"}
@@ -30,14 +27,11 @@ OPTIONAL_TRANSACTION_DEFAULTS = {
     "Is_recurring": False,
 }
 
-
 def require_columns(df: pl.DataFrame, required_columns: Iterable[str], name: str) -> None:
-    """Raise a readable error if a required source column is absent."""
     missing_columns = [column for column in required_columns if column not in df.columns]
     if missing_columns:
         missing = ", ".join(missing_columns)
         raise ValueError(f"{name} is missing required columns: {missing}")
-
 
 def _ensure_columns(df: pl.DataFrame, defaults: dict[str, object]) -> pl.DataFrame:
     expressions = [
@@ -49,7 +43,6 @@ def _ensure_columns(df: pl.DataFrame, defaults: dict[str, object]) -> pl.DataFra
         return df
     return df.with_columns(expressions)
 
-
 def _bool_expr(column: str) -> pl.Expr:
     text = pl.col(column).cast(pl.Utf8, strict=False).str.to_lowercase()
     numeric = pl.col(column).cast(pl.Int8, strict=False)
@@ -58,13 +51,7 @@ def _bool_expr(column: str) -> pl.Expr:
         | text.is_in(TRUTHY_VALUES)
         | (numeric == 1)
     )
-    return (
-        pl.when(text.is_in(FALSEY_VALUES))
-        .then(False)
-        .otherwise(parsed)
-        .fill_null(False)
-    )
-
+    return pl.when(text.is_in(FALSEY_VALUES)).then(False).otherwise(parsed).fill_null(False)
 
 def _parse_date_expr(column: str) -> pl.Expr:
     text = pl.col(column).cast(pl.Utf8, strict=False)
@@ -78,7 +65,6 @@ def _parse_date_expr(column: str) -> pl.Expr:
             text.str.to_datetime(format="%Y-%m-%dT%H:%M:%S", strict=False).dt.date(),
         ]
     )
-
 
 def _parse_datetime_expr(column: str) -> pl.Expr:
     text = pl.col(column).cast(pl.Utf8, strict=False)
@@ -94,14 +80,7 @@ def _parse_datetime_expr(column: str) -> pl.Expr:
         ]
     )
 
-
-def add_target(transactions: pl.DataFrame, label: int) -> pl.DataFrame:
-    """Attach supervised label: business=1, consumer=0."""
-    return transactions.with_columns(pl.lit(label).cast(pl.Int8).alias(TARGET_COLUMN))
-
-
 def normalize_transactions(transactions: pl.DataFrame, name: str) -> pl.DataFrame:
-    """Normalize transaction dtypes and basic missing values before aggregation."""
     require_columns(transactions, REQUIRED_TRANSACTION_COLUMNS, name)
     transactions = _ensure_columns(transactions, OPTIONAL_TRANSACTION_DEFAULTS)
 
@@ -110,21 +89,15 @@ def normalize_transactions(transactions: pl.DataFrame, name: str) -> pl.DataFram
             pl.col(CARD_ID_COLUMN).cast(pl.Utf8, strict=False),
             pl.col("merchant_id").cast(pl.Utf8, strict=False),
             pl.col("transaction_amount_kzt").cast(pl.Float64, strict=False),
-            pl.col("mcc").cast(pl.Utf8, strict=False),
-            pl.col("channel")
-            .cast(pl.Utf8, strict=False)
-            .str.to_lowercase()
-            .fill_null("unknown"),
+            pl.col("mcc").cast(pl.Utf8, strict=False).fill_null("unknown_mcc"),
+            pl.col("channel").cast(pl.Utf8, strict=False).str.to_lowercase().fill_null("unknown"),
             pl.col("country").cast(pl.Utf8, strict=False),
             _bool_expr("tokenized").alias("tokenized"),
             _bool_expr("Is_recurring").alias("Is_recurring"),
             _parse_date_expr("transaction_date").alias("transaction_date"),
-            _parse_datetime_expr("transaction_timestamp").alias(
-                "transaction_timestamp"
-            ),
+            _parse_datetime_expr("transaction_timestamp").alias("transaction_timestamp"),
         ]
     )
-
     cleaned = cleaned.with_columns(
         pl.coalesce(
             [
@@ -134,14 +107,9 @@ def normalize_transactions(transactions: pl.DataFrame, name: str) -> pl.DataFram
         ).alias("transaction_datetime")
     )
 
-    return cleaned.filter(
-        pl.col(CARD_ID_COLUMN).is_not_null()
-        & pl.col("transaction_amount_kzt").is_not_null()
-    )
-
+    return cleaned.filter(pl.col(CARD_ID_COLUMN).is_not_null() & pl.col("transaction_amount_kzt").is_not_null())
 
 def normalize_merchants(merchants: pl.DataFrame) -> pl.DataFrame:
-    """Prepare merchant reference columns for a safe join."""
     require_columns(merchants, ["merchant_id"], "merchants_reference")
 
     rename_map = {}
@@ -151,11 +119,7 @@ def normalize_merchants(merchants: pl.DataFrame) -> pl.DataFrame:
 
     merchants = _ensure_columns(
         merchants,
-        {
-            "merchant_name": None,
-            "merchant_country": None,
-            "recurring_capable": False,
-        },
+        {"merchant_name": None, "merchant_country": None, "recurring_capable": False},
     )
 
     return (
@@ -170,41 +134,13 @@ def normalize_merchants(merchants: pl.DataFrame) -> pl.DataFrame:
         .unique(subset=["merchant_id"], keep="first")
         .select(
             [
-                "merchant_id",
-                "merchant_name",
-                "merchant_country",
-                "recurring_capable",
-                *(
-                    ["merchant_reference_mcc"]
-                    if "merchant_reference_mcc" in merchants.columns
-                    else []
-                ),
+                "merchant_id", "merchant_name", "merchant_country", "recurring_capable",
+                *(["merchant_reference_mcc"] if "merchant_reference_mcc" in merchants.columns else []),
             ]
         )
     )
 
-
-def combine_transactions(
-    business_cards: pl.DataFrame,
-    consumer_cards: pl.DataFrame,
-) -> pl.DataFrame:
-    """Normalize both segments, attach labels, and vertically concatenate."""
-    business = add_target(
-        normalize_transactions(business_cards, "business_cards"),
-        label=1,
-    )
-    consumer = add_target(
-        normalize_transactions(consumer_cards, "consumer_cards"),
-        label=0,
-    )
-    return pl.concat([business, consumer], how="vertical_relaxed")
-
-
-def merge_merchants(
-    transactions: pl.DataFrame,
-    merchants_reference: pl.DataFrame,
-) -> pl.DataFrame:
-    """Left join transaction rows with merchant reference data."""
+def merge_merchants(transactions: pl.DataFrame, merchants_reference: pl.DataFrame) -> pl.DataFrame:
     merchants = normalize_merchants(merchants_reference)
     merged = transactions.join(merchants, on="merchant_id", how="left")
     return merged.with_columns(
@@ -214,13 +150,7 @@ def merge_merchants(
         ]
     )
 
-
-def prepare_transactions(
-    business_cards: pl.DataFrame,
-    consumer_cards: pl.DataFrame,
-    merchants_reference: pl.DataFrame,
-) -> pl.DataFrame:
-    """Full transaction-level preparation step used by main.py."""
-    transactions = combine_transactions(business_cards, consumer_cards)
-    return merge_merchants(transactions, merchants_reference)
-
+def prepare_transactions(transactions: pl.DataFrame, merchants_reference: pl.DataFrame, dataset_name: str) -> pl.DataFrame:
+    """Full transaction-level preparation for a specific dataset."""
+    cleaned = normalize_transactions(transactions, dataset_name)
+    return merge_merchants(cleaned, merchants_reference)
