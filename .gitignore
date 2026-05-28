@@ -40,8 +40,8 @@ Thumbs.db
 *.json
 raw_data/
 output/
-data/raw/*
-!data/raw/.gitkeep
+mastercard_rewrite_project/data/raw/*
+!mastercard_rewrite_project/data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 outputs/figures/*

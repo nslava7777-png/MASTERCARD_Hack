@@ -1,154 +1,111 @@
-"""Build business-oriented card-level features with Polars for PU-Learning."""
-
 from __future__ import annotations
+import numpy as np
+import pandas as pd
 import polars as pl
-
-# Обязательно убедитесь, что SMALL_TRANSACTION_AMOUNT и LARGE_TRANSACTION_AMOUNT
-# прописаны в src.config, иначе код выдаст ошибку импорта.
-from src.config import (
-    CARD_ID_COLUMN,
-    TARGET_COLUMN,
-    SMALL_TRANSACTION_AMOUNT,
-    LARGE_TRANSACTION_AMOUNT,
-)
-from src.preprocessing import require_columns
-
-# TARGET_COLUMN убран из списка обязательных для сырых данных,
-# так как теперь метки ставятся искусственно после агрегации.
-# Добавлен merchant_id для расчета вашей фирменной фичи (diversity).
-FEATURE_REQUIRED_COLUMNS = [
-    CARD_ID_COLUMN,
-    "transaction_amount_kzt",
-    "mcc",
-    "merchant_id",
-    "channel",
-    "tokenized",
-    "transaction_date",
-    "transaction_datetime",
-]
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import RobustScaler
+from src.config import CARD_ID_COLUMN, TARGET_COLUMN
 
 
-def _add_behavior_indicators(transactions: pl.DataFrame) -> pl.DataFrame:
-    """Создание промежуточных флагов на уровне отдельных транзакций."""
-    amount_abs = pl.col("transaction_amount_kzt").abs()
+def _safe_ratio(num, den, alias):
+    return pl.when(den > 0).then(num / den).otherwise(0.0).alias(alias)
 
-    return transactions.with_columns(
-        # channel может быть null — явно сравниваем со строкой
-        (pl.col("channel") == "online")
-        .fill_null(False)
-        .alias("_is_online"),
 
-        # tokenized: cast сначала в Int8, потом в Boolean — обходит mixed types
-        pl.col("tokenized")
-        .cast(pl.Int8, strict=False)
-        .fill_null(0)
-        .cast(pl.Boolean)
-        .alias("_is_tokenized"),
+def aggregate_card_features(tx, label):
+    drop_cols = [c for c in ["source_name", "dt", "ts_raw"] if c in tx.columns]
+    if drop_cols:
+        tx = tx.drop(drop_cols)
 
-        # weekday(): 1=пн ... 7=вс → выходные это 6 и 7
-        (pl.col("transaction_date").dt.weekday() >= 6)
-        .fill_null(False)
-        .alias("_is_weekend"),
-
-        # Вечер: 18–23 включительно
-        pl.col("transaction_datetime")
-        .dt.hour()
-        .is_between(18, 23)
-        .fill_null(False)
-        .alias("_is_evening"),
-
-        # Фирменные фичи: маркеры размеров транзакций
-        (amount_abs <= SMALL_TRANSACTION_AMOUNT)
-        .fill_null(False)
-        .alias("_is_small_txn"),
-
-        (amount_abs >= LARGE_TRANSACTION_AMOUNT)
-        .fill_null(False)
-        .alias("_is_large_txn"),
+    top_merch = (
+        tx.group_by([CARD_ID_COLUMN, "merchant_id"]).agg(pl.len().alias("cnt"))
+          .sort([CARD_ID_COLUMN, "cnt"], descending=[False, True])
+          .group_by(CARD_ID_COLUMN).agg(pl.first("cnt").alias("top1_cnt"))
+    )
+    per_amt = (
+        tx.with_columns(pl.col("amount").round(0).alias("amt_r"))
+          .group_by([CARD_ID_COLUMN, "amt_r"]).agg(pl.len().alias("cnt"))
+    )
+    rep = per_amt.group_by(CARD_ID_COLUMN).agg(
+        pl.col("cnt").max().fill_null(1).alias("max_same_amt_count")
+    )
+    daily = tx.group_by([CARD_ID_COLUMN, "date"]).agg(pl.len().alias("d_cnt"))
+    burst = (
+        daily.group_by(CARD_ID_COLUMN)
+             .agg([
+                 pl.col("d_cnt").mean().fill_null(1).alias("dmean"),
+                 pl.col("d_cnt").std().fill_null(0).alias("dstd"),
+             ])
+             .with_columns(_safe_ratio(pl.col("dstd"), pl.col("dmean"), "burst_cv"))
+             .drop(["dmean", "dstd"])
+    )
+    amt_q95 = tx.group_by(CARD_ID_COLUMN).agg(
+        pl.col("amt_abs").quantile(0.95).alias("amt_q95")
     )
 
-
-def calculate_mcc_business_ratio(df_biz: pl.DataFrame, df_cons: pl.DataFrame) -> pl.DataFrame:
-    """
-    PU-Learning: Расчет бизнес-веса MCC как отношение его частоты
-    в эталонном бизнесе к общей частоте (бизнес + потребители).
-    Заменяет старый Target Encoder.
-    """
-    mcc_x = df_biz.group_by("mcc").len(name="count_biz")
-    mcc_y = df_cons.group_by("mcc").len(name="count_cons")
-
-    mcc_weights = mcc_x.join(mcc_y, on="mcc", how="full", coalesce=True).fill_null(0)
-
-    # Считаем долю бизнеса. Добавлено 1e-5 для защиты от деления на ноль.
-    mcc_weights = mcc_weights.with_columns(
-        (pl.col("count_biz") / (pl.col("count_biz") + pl.col("count_cons") + 1e-5)).alias("mcc_business_ratio")
-    )
-    return mcc_weights.select(["mcc", "mcc_business_ratio"])
-
-
-def _aggregate_to_cards(transactions_df: pl.DataFrame, mcc_weights: pl.DataFrame, label: int) -> pl.DataFrame:
-    """Группировка обогащенных транзакций по картам и расчет относительных коэффициентов."""
-    # Присоединяем веса MCC и добавляем флаги поведения
-    df_proc = transactions_df.join(mcc_weights, on="mcc", how="left").fill_null(0.0)
-    df_proc = _add_behavior_indicators(df_proc)
-
-    # Базовая агрегация
-    card_features = df_proc.group_by(CARD_ID_COLUMN).agg([
-        pl.len().alias("total_transactions"),
-        pl.col("transaction_amount_kzt").mean().alias("avg_amount"),
-        pl.col("transaction_amount_kzt").std().alias("std_amount"),
-        pl.col("mcc").drop_nulls().n_unique().alias("unique_mcc"),
-        pl.col("merchant_id").drop_nulls().n_unique().alias("unique_merchants"),
-
-        pl.col("_is_online").mean().alias("online_share"),
-        pl.col("_is_tokenized").mean().alias("tokenized_share"),
-        pl.col("_is_weekend").mean().alias("weekend_share"),
-        pl.col("_is_evening").mean().alias("evening_share"),
-
-        pl.col("_is_small_txn").mean().alias("small_txn_share"),
-        pl.col("_is_large_txn").mean().alias("large_txn_share"),
-
-        pl.col("mcc_business_ratio").mean().alias("card_b2b_index"),
+    card = tx.group_by(CARD_ID_COLUMN).agg([
+        pl.len().alias("n_txns"),
+        pl.col("amt_abs").mean().alias("amt_mean"),
+        pl.col("amt_abs").std().fill_null(0).alias("amt_std"),
+        pl.col("amt_abs").median().alias("amt_median"),
+        pl.col("amt_abs").min().alias("amt_min"),
+        pl.col("log_amt").std().fill_null(0).alias("log_amt_std"),
+        pl.col("merchant_id").n_unique().alias("n_merchants"),
+        pl.col("mcc").n_unique().alias("mcc_diversity"),
+        pl.col("country").n_unique().alias("n_countries_raw"),
+        pl.col("f_online").mean().alias("online_ratio"),
+        pl.col("f_token").mean().alias("token_ratio"),
+        pl.col("f_recur").mean().alias("recur_ratio"),
+        pl.col("f_night").mean().alias("night_ratio"),
+        pl.col("f_weekend").mean().alias("weekend_ratio"),
+        pl.col("f_susp_mcc").mean().alias("susp_mcc_ratio"),
+        pl.col("f_premium").mean().alias("premium_ratio"),
+        pl.col("f_online_night").mean().alias("online_night_ratio"),
+        pl.col("hour").mean().alias("hour_mean"),
     ])
+    card = card.with_columns([
+        _safe_ratio(pl.col("n_merchants"), pl.col("n_txns"),           "merchant_diversity"),
+        _safe_ratio(pl.col("n_countries_raw") - 1, pl.col("n_txns"),  "foreign_ratio"),
+        _safe_ratio(pl.col("amt_std"), pl.col("amt_mean") + 1e-6,     "amt_cv"),
+        _safe_ratio(pl.col("n_txns"), pl.col("n_merchants") + 1e-6,   "txns_per_merchant"),
+    ]).drop("n_countries_raw")
 
-    # Расчет финальных фирменных коэффициентов
-    card_features = card_features.with_columns(
-        [
-            # amount_cv: показывает стабильность чека
-            pl.when(pl.col("avg_amount").abs() > 0)
-            .then(pl.col("std_amount") / pl.col("avg_amount").abs())
-            .otherwise(0.0)
-            .alias("amount_cv"),
-
-            # merchant_diversity_ratio: показывает концентрацию закупок
-            pl.when(pl.col("total_transactions") > 0)
-            .then(pl.col("unique_merchants") / pl.col("total_transactions"))
-            .otherwise(0.0)
-            .alias("merchant_diversity_ratio")
-        ]
-    ).drop(["std_amount", "unique_merchants"]).fill_null(0)
-
-    # Жестко проставляем целевую переменную (1 для бизнеса, 0 для потребителей)
-    return (
-        card_features
-        .with_columns(pl.lit(label).cast(pl.Int8).alias(TARGET_COLUMN))
-        .sort(CARD_ID_COLUMN)
+    card = (
+        card.join(top_merch, on=CARD_ID_COLUMN, how="left")
+            .join(rep,       on=CARD_ID_COLUMN, how="left")
+            .join(burst,     on=CARD_ID_COLUMN, how="left")
+            .join(amt_q95,   on=CARD_ID_COLUMN, how="left")
+            .fill_null(0)
     )
+    card = card.with_columns(
+        _safe_ratio(pl.col("top1_cnt"), pl.col("n_txns"), "same_merchant_ratio")
+    ).drop("top1_cnt")
+
+    if label is not None:
+        card = card.with_columns(pl.lit(label).alias(TARGET_COLUMN))
+    return card.sort(CARD_ID_COLUMN)
 
 
-def build_pu_features(df_biz_trans: pl.DataFrame, df_cons_trans: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Главная функция генерации фичей.
-    Заменяет старую build_features_safe, принимая на вход два раздельных потока данных.
-    """
-    require_columns(df_biz_trans, FEATURE_REQUIRED_COLUMNS, "business transactions")
-    require_columns(df_cons_trans, FEATURE_REQUIRED_COLUMNS, "consumer transactions")
+def build_dataset_features(biz_tx, cons_tx):
+    return aggregate_card_features(biz_tx, 1), aggregate_card_features(cons_tx, 0)
 
-    # 1. Обучение весов MCC (ИЗОЛИРОВАНО: сравниваем X и Y)
-    mcc_weights = calculate_mcc_business_ratio(df_biz_trans, df_cons_trans)
 
-    # 2. Агрегация транзакций до уровня карт с проставлением правильных меток
-    biz_card_features = _aggregate_to_cards(df_biz_trans, mcc_weights, label=1)
-    cons_card_features = _aggregate_to_cards(df_cons_trans, mcc_weights, label=0)
+def compute_biz_distance_score(X_train, y_train, X_score):
+    common = [c for c in X_train.columns if c in X_score.columns]
+    scaler = RobustScaler()
+    Xtr = scaler.fit_transform(X_train[common])
+    Xsc = scaler.transform(X_score[common])
+    biz_c = Xtr[y_train == 1].mean(axis=0)
+    con_c = Xtr[y_train == 0].mean(axis=0)
+    diff  = np.linalg.norm(Xsc - con_c, axis=1) - np.linalg.norm(Xsc - biz_c, axis=1)
+    score = 1.0 / (1.0 + np.exp(-diff / (diff.std() + 1e-6)))
+    return score.astype(np.float32)
 
-    return biz_card_features, cons_card_features
+
+def compute_isolation_score(X_cons_train, X_cons_score, random_state=42):
+    iso = IsolationForest(n_estimators=300, contamination=0.05,
+                          random_state=random_state, n_jobs=-1)
+    iso.fit(X_cons_train)
+    raw   = iso.decision_function(X_cons_score)
+    score = -raw
+    score = (score - score.min()) / (score.max() - score.min() + 1e-9)
+    return score.astype(np.float32)
