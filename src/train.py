@@ -1,37 +1,10 @@
 from __future__ import annotations
 """
-train.py — v6
-=============
-Grey Zone Refiner (v6) — Confident-Sampling approach
-------------------------------------------------------
-PROBLEM with v5:
-  Linear rescaling only changed score values, NOT the ranking.
-  Card at 0.50 became 0.67 — still ambiguous. No real separation.
-
-SOLUTION (v6):
-  Build training data from boundary examples on BOTH sides of grey zone:
-
-    Label 0 (confident consumers):
-      Consumer cards with ensemble_score < 0.30
-      Base ensemble is very certain: these are real consumers.
-
-    Label 1 (confident businesses):
-      Business train cards where OOF score > 0.80
-      These are the clearest business behavioural patterns.
-
-  Model features: 10 SUBTLE behavioural signals that the base ensemble
-  has NOT fully exploited (timing, commercial pattern, payment structure).
-  Excludes primary signals: token_ratio, online_ratio, susp_mcc_ratio,
-  amt_mean, n_txns — already used up by base ensemble.
-
-  Applied only to grey zone [0.30, 0.70]:
-    final = 0.45 * ensemble + 0.55 * grey_score
-    Grey model gets majority weight — it was trained specifically
-    to discriminate within the ambiguous region.
-
-  Expected outcome:
-    Cards bunched at 0.45-0.65 now spread to 0.30-0.80 depending on
-    whether subtle patterns say "consumer" or "business".
+train.py — v6_fixed_final
+=========================
+Исправленный пайплайн двухэтапного PU-дообучения (Grey Zone Refiner) без утечек данных.
+Включает корректную валидацию базовых моделей, расчет центроид расстояний внутри фолдов
+и изоляцию Confident-Sampling для серой зоны.
 """
 import numpy as np
 import pandas as pd
@@ -44,10 +17,12 @@ from sklearn.linear_model import LogisticRegression
 from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
 
+# Импорт безопасных функций для расчета фичей расстояний и аномалий
+from src.feature_engineering import fit_biz_distance_predictor, compute_biz_distance_score, compute_isolation_score
+
 from src.config import (
-    CONF_BIZ_THRESH, EVAL_CV_SPLITS, GREY_ZONE_FEATURES,
+    CONF_BIZ_THRESH, EVAL_CV_SPLITS,
     GREY_ZONE_HIGH, GREY_ZONE_LOW, RANDOM_STATE,
-    TUNE_CV_SPLITS, TUNE_N_ITER,
 )
 from src.evaluate import calculate_metrics
 
@@ -122,7 +97,6 @@ def param_grids():
 
 
 def select_best_model_name(metrics_by_model, primary="roc_auc", fallback="f1"):
-    """Select best model by primary metric, tie-break with fallback."""
     return max(
         metrics_by_model,
         key=lambda n: (
@@ -132,128 +106,8 @@ def select_best_model_name(metrics_by_model, primary="roc_auc", fallback="f1"):
     )
 
 
-def tune_all_models(X, y, random_state=RANDOM_STATE):
-    spw = class_weight_ratio(y)
-    print(f"  Class ratio (neg/pos) = {spw:.2f}")
-    candidates = build_candidates(random_state, spw)
-    grids = param_grids()
-    cv = StratifiedKFold(n_splits=TUNE_CV_SPLITS, shuffle=True,
-                         random_state=random_state)
-    tuned, summary = {}, {}
-    for name, pipe in candidates.items():
-        print(f"    [{name}] RandomizedSearchCV "
-              f"(n_iter={TUNE_N_ITER}, cv={TUNE_CV_SPLITS})...")
-        search = RandomizedSearchCV(
-            pipe, grids[name], n_iter=TUNE_N_ITER, scoring="roc_auc",
-            cv=cv, n_jobs=-1, random_state=random_state,
-            refit=True, verbose=0,
-        )
-        search.fit(X, y)
-        tuned[name]   = search.best_estimator_
-        summary[name] = {
-            "best_cv_roc_auc": float(search.best_score_),
-            "best_params": search.best_params_,
-        }
-        print(f"      cv_roc_auc = {search.best_score_:.4f}")
-    return tuned, summary
-
-
-def evaluate_tuned_models_oof(tuned_models, X, y, random_state=RANDOM_STATE):
-    """
-    5-Fold OOF evaluation for all tuned models.
-
-    WHY MULTIPLE TRAINING CYCLES?
-    Each fold trains the model on 4/5 of the data and validates on 1/5.
-    With 5 folds x 3 models = 15 training runs total.
-    This gives an honest OOF score — every sample is validated exactly
-    once, preventing data leakage and providing stable metric estimates.
-    """
-    cv = StratifiedKFold(n_splits=EVAL_CV_SPLITS, shuffle=True,
-                         random_state=random_state)
-    oof_proba = {n: np.zeros(len(X)) for n in tuned_models}
-
-    for fold_i, (tr_idx, va_idx) in enumerate(cv.split(X, y), 1):
-        print(f"  Fold {fold_i}/{EVAL_CV_SPLITS}...")
-        for name, tuned in tuned_models.items():
-            m = clone(tuned)
-            m.fit(X.iloc[tr_idx], y[tr_idx])
-            oof_proba[name][va_idx] = m.predict_proba(X.iloc[va_idx])[:, 1]
-
-    metrics = {}
-    for name, probs in oof_proba.items():
-        metrics[name] = calculate_metrics(y, (probs >= 0.5).astype(int), probs)
-    return metrics, oof_proba
-
-
-def fit_final_model(best_name, tuned_models, X, y):
-    m = clone(tuned_models[best_name])
-    m.fit(X, y)
-    return m
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GREY ZONE v6 — Confident-Sampling Refiner
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_grey_zone_training_data(
-    X_train, y_train, oof_scores_train,
-    X_cons, ensemble_scores_cons,
-    grey_features,
-    conf_biz_thresh=CONF_BIZ_THRESH,
-    grey_low=GREY_ZONE_LOW,
-):
-    """
-    Build confident-sampling training data for the grey zone refiner.
-
-    Label 0: Consumer cards with ensemble_score < grey_low (0.30)
-      The base ensemble is very certain about these — pure consumers.
-
-    Label 1: Business train cards with OOF score > conf_biz_thresh (0.80)
-      These are the clearest business behavioural patterns.
-
-    Only GREY_ZONE_FEATURES (subtle signals) are used.
-    """
-    avail   = [f for f in grey_features if f in X_cons.columns]
-    missing = [f for f in grey_features if f not in X_cons.columns]
-    if missing:
-        print(f"    [grey zone] WARNING: missing features skipped: {missing}")
-
-    mask_conf_cons = ensemble_scores_cons < grey_low
-    X_conf_cons    = X_cons.loc[mask_conf_cons, avail].copy()
-    y_conf_cons    = np.zeros(int(mask_conf_cons.sum()), dtype=int)
-
-    biz_mask      = y_train == 1
-    biz_oof       = oof_scores_train[biz_mask]
-    mask_conf_biz = biz_oof > conf_biz_thresh
-    X_conf_biz    = X_train.loc[biz_mask, avail].iloc[np.where(mask_conf_biz)[0]].copy()
-    y_conf_biz    = np.ones(int(mask_conf_biz.sum()), dtype=int)
-
-    X_grey = pd.concat([X_conf_cons, X_conf_biz], ignore_index=True)
-    y_grey = np.hstack([y_conf_cons, y_conf_biz])
-
-    n_cons = int(mask_conf_cons.sum())
-    n_biz  = int(mask_conf_biz.sum())
-    ratio  = float(n_cons / max(n_biz, 1))
-    print(f"    [grey zone train] confident_consumers={n_cons:,}  "
-          f"confident_biz={n_biz:,}  ratio={ratio:.1f}:1")
-    print(f"    [grey zone train] using {len(avail)} subtle features: {avail}")
-    return X_grey, y_grey, avail
-
-
 def train_grey_zone_model(X_grey, y_grey, random_state=RANDOM_STATE):
-    """
-    Train a shallow LightGBM specifically for the grey zone.
-
-    Hyperparameter choices explained:
-      num_leaves=15       — shallow trees: subtle signals, not brute-force
-      min_child_samples=30 — needs solid evidence per leaf (avoids noise)
-      reg_lambda=5.0      — strong regularisation (small training set)
-      learning_rate=0.02  — slow, careful learning
-      colsample_bytree=0.7 — not all subtle features every tree
-      scale_pos_weight    — handles imbalance (many consumers, few biz)
-    """
     spw = class_weight_ratio(y_grey)
-    print(f"    [grey zone model] scale_pos_weight={spw:.2f}")
     pipe = Pipeline([
         ("imp",   SimpleImputer(strategy="median")),
         ("sc",    RobustScaler()),
@@ -276,71 +130,161 @@ def train_grey_zone_model(X_grey, y_grey, random_state=RANDOM_STATE):
     return pipe
 
 
-def apply_grey_zone_refiner(
-    ensemble_scores,
-    X_cons,
-    X_train,
-    y_train,
-    oof_scores_train,
+def build_grey_zone_training_data(
+    X_train_fold, y_train_fold, base_scores_train_fold,
+    X_cons, base_scores_cons_fold,
     grey_features,
+    conf_biz_thresh=CONF_BIZ_THRESH,
     grey_low=GREY_ZONE_LOW,
-    grey_high=GREY_ZONE_HIGH,
-    blend_weight=0.55,
-    random_state=RANDOM_STATE,
 ):
     """
-    Full grey zone confident-sampling refiner pipeline.
-
-    STEPS:
-      1. Build training data from confident boundary examples
-      2. Train shallow LGBM on 10 subtle features
-      3. Predict on grey zone cards [grey_low, grey_high]
-      4. Blend: final = (1-w)*ensemble + w*grey_score
-         w=0.55 — grey model has majority weight because it was trained
-         specifically to discriminate within the ambiguous region
-
-    EXPECTED RESULT:
-      Cards bunched at 0.45-0.65 spread out to 0.30-0.80 depending on
-      whether subtle behavioural patterns say "consumer" or "business".
+    БЕЗ УТЕЧЕК: Сборка обучающего сета для рефайнера внутри конкретного фолда.
+    Использует только тонкие поведенческие признаки (включая commercial_hours_ratio).
     """
+    avail = [f for f in grey_features if f in X_cons.columns]
+    
+    # Label 0: Надежные потребители из неразмеченных данных по оценке текущего фолда базовой модели
+    mask_conf_cons = base_scores_cons_fold < grey_low
+    X_conf_cons    = X_cons.loc[mask_conf_cons, avail].copy()
+    y_conf_cons    = np.zeros(int(mask_conf_cons.sum()), dtype=int)
+
+    # Label 1: Надежные бизнес-карты из текущего обучающего фолда
+    biz_mask      = y_train_fold == 1
+    biz_scores    = base_scores_train_fold[biz_mask]
+    mask_conf_biz = biz_scores > conf_biz_thresh
+    X_conf_biz    = X_train_fold.loc[biz_mask, avail].iloc[np.where(mask_conf_biz)[0]].copy()
+    y_conf_biz    = np.ones(int(mask_conf_biz.sum()), dtype=int)
+
+    X_grey = pd.concat([X_conf_cons, X_conf_biz], ignore_index=True)
+    y_grey = np.hstack([y_conf_cons, y_conf_biz])
+
+    return X_grey, y_grey, avail
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ПОЛНЫЙ ЦИКЛ ОЦЕНКИ КАЧЕСТВА (OOF) БЕЗ УТЕЧЕК
+# ─────────────────────────────────────────────────────────────────────────────
+
+def evaluate_full_pipeline_oof(base_model_candidate, X_train, y_train, X_cons, grey_features, random_state=RANDOM_STATE):
+    """
+    Честная кросс-валидация всей системы. 
+    Все динамические фичи (расстояния) и дообучение серой зоны изолированы внутри фолдов.
+    """
+    cv = StratifiedKFold(n_splits=EVAL_CV_SPLITS, shuffle=True, random_state=random_state)
+    final_oof_scores = np.zeros(len(X_train))
+    
+    print("\n[OOF Validation] Запуск кросс-валидации пайплайна...")
+    
+    for fold_i, (tr_idx, va_idx) in enumerate(cv.split(X_train, y_train), 1):
+        print(f"  --- Фолд {fold_i}/{EVAL_CV_SPLITS} ---")
+        
+        # Выделяем чистый трейн и чистую валидацию для размеченных карт
+        X_tr_f, y_tr_f = X_train.iloc[tr_idx].copy(), y_train[tr_idx]
+        X_va_f, y_va_f = X_train.iloc[va_idx].copy(), y_train[va_idx]
+        
+        # ШАГ 1: Извлекаем фичи расстояний до центроид БЕЗ утечки
+        # Обучаем скейлер и вычисляем центроиды СТРОГО на тренировочной части фолда
+        scaler, biz_centroid, con_centroid = fit_biz_distance_predictor(X_tr_f, y_tr_f)
+        
+        # Генерируем мета-признак расстояния для трейна, валидации и неразмеченных данных
+        X_tr_f["biz_distance_score"] = compute_biz_distance_score(scaler, biz_centroid, con_centroid, X_tr_f)
+        X_va_f["biz_distance_score"] = compute_biz_distance_score(scaler, biz_centroid, con_centroid, X_va_f)
+        
+        X_cons_fold = X_cons.copy()
+        X_cons_fold["biz_distance_score"] = compute_biz_distance_score(scaler, biz_centroid, con_centroid, X_cons_fold)
+        
+        # ШАГ 2: Обучаем базовую модель на обогащенных признаках тренировочного фолда
+        fold_base_model = clone(base_model_candidate)
+        fold_base_model.fit(X_tr_f, y_tr_f)
+        
+        # ШАГ 3: Скоринг для отбора уверенных кандидатов
+        base_scores_train_fold = fold_base_model.predict_proba(X_tr_f)[:, 1]
+        base_scores_cons_fold  = fold_base_model.predict_proba(X_cons_fold)[:, 1]
+        
+        # ШАГ 4: Сборка датасета для серой зоны на основе предсказаний ЭТОГО фолда
+        X_grey_train, y_grey_train, avail = build_grey_zone_training_data(
+            X_train_fold=X_tr_f,
+            y_train_fold=y_tr_f,
+            base_scores_train_fold=base_scores_train_fold,
+            X_cons=X_cons_fold,
+            base_scores_cons_fold=base_scores_cons_fold,
+            grey_features=grey_features,
+            conf_biz_thresh=CONF_BIZ_THRESH,
+            grey_low=GREY_ZONE_LOW,
+        )
+        
+        base_scores_val = fold_base_model.predict_proba(X_va_f)[:, 1]
+        fold_final_val_scores = base_scores_val.copy()
+        
+        # ШАГ 5: Обучение серой модели и блендинг (только если выборка сформировалась корректно)
+        if len(avail) > 0 and y_grey_train.sum() > 0 and (y_grey_train == 0).sum() > 0:
+            fold_grey_model = train_grey_zone_model(X_grey_train, y_grey_train, random_state)
+            
+            mask_grey_val = (base_scores_val >= GREY_ZONE_LOW) & (base_scores_val <= GREY_ZONE_HIGH)
+            if mask_grey_val.sum() > 0:
+                X_grey_pred_val = X_va_f.loc[mask_grey_val, avail]
+                grey_proba_val = fold_grey_model.predict_proba(X_grey_pred_val)[:, 1]
+                
+                # Блендинг для пограничных карт на валидации
+                fold_final_val_scores[mask_grey_val] = (0.45 * base_scores_val[mask_grey_val]) + (0.55 * grey_proba_val)
+        
+        final_oof_scores[va_idx] = fold_final_val_scores
+
+    final_metrics = calculate_metrics(y_train, (final_oof_scores >= 0.5).astype(int), final_oof_scores)
+    print(f"\n[Итог контроля] Честный стабильный OOF AUC: {final_metrics.get('roc_auc', 0):.6f}")
+    return final_metrics, final_oof_scores
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# СТАДИЯ СУПЕР-ФИНАЛА ДЛЯ ИНФЕРЕНСА (НА ВСЕХ ДАННЫХ)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_and_apply_final_pipeline(best_base_model, X_train, y_train, X_cons, grey_features, random_state=RANDOM_STATE):
+    """
+    Финальный расчет предсказаний для неразмеченных данных (X_cons) перед отправкой сабмишена.
+    Обучается один раз на полном объеме данных.
+    """
+    print("\n[Final Inference] Сборка итогового решения на 100% данных...")
+    
+    X_train_final = X_train.copy()
+    X_cons_final  = X_cons.copy()
+    
+    # 1. Расчет эталонных центроид по всей обучающей выборке
+    scaler, biz_centroid, con_centroid = fit_biz_distance_predictor(X_train_final, y_train)
+    X_train_final["biz_distance_score"] = compute_biz_distance_score(scaler, biz_centroid, con_centroid, X_train_final)
+    X_cons_final["biz_distance_score"]  = compute_biz_distance_score(scaler, biz_centroid, con_centroid, X_cons_final)
+    
+    # 2. Финальное обучение базовой модели
+    final_base_model = clone(best_base_model)
+    final_base_model.fit(X_train_final, y_train)
+    
+    base_scores_train = final_base_model.predict_proba(X_train_final)[:, 1]
+    base_scores_cons  = final_base_model.predict_proba(X_cons_final)[:, 1]
+    
+    # 3. Финальная сборка обучающего сета серой зоны
     X_grey_train, y_grey_train, avail = build_grey_zone_training_data(
-        X_train, y_train, oof_scores_train,
-        X_cons, ensemble_scores,
-        grey_features, CONF_BIZ_THRESH, grey_low,
+        X_train_fold=X_train_final,
+        y_train_fold=y_train,
+        base_scores_train_fold=base_scores_train,
+        X_cons=X_cons_final,
+        base_scores_cons_fold=base_scores_cons,
+        grey_features=grey_features,
+        conf_biz_thresh=CONF_BIZ_THRESH,
+        grey_low=GREY_ZONE_LOW,
     )
-
-    if len(avail) == 0 or y_grey_train.sum() == 0:
-        print("    [grey zone] Insufficient data — skipping refiner")
-        return ensemble_scores.copy(), None
-
-    grey_model = train_grey_zone_model(X_grey_train, y_grey_train, random_state)
-
-    mask_grey = (ensemble_scores >= grey_low) & (ensemble_scores <= grey_high)
-    n_grey    = int(mask_grey.sum())
-    print(f"    [grey zone] Refining {n_grey:,} grey zone cards "
-          f"[{grey_low}, {grey_high}]...")
-
-    final_scores = ensemble_scores.copy().astype(np.float64)
-
-    if n_grey > 0:
-        X_grey_pred = X_cons.loc[mask_grey, avail]
-        grey_proba  = grey_model.predict_proba(X_grey_pred)[:, 1]
-
-        blended = ((1 - blend_weight) * ensemble_scores[mask_grey]
-                   + blend_weight * grey_proba)
-        final_scores[mask_grey] = blended
-
-        before = ensemble_scores[mask_grey]
-        after  = blended
-        print(f"    [grey zone] Before: mean={before.mean():.3f}  "
-              f"std={before.std():.3f}  min={before.min():.3f}  max={before.max():.3f}")
-        print(f"    [grey zone] After:  mean={after.mean():.3f}  "
-              f"std={after.std():.3f}  min={after.min():.3f}  max={after.max():.3f}")
-
-        delta = after - before
-        moved_up   = int((delta >  0.05).sum())
-        moved_down = int((delta < -0.05).sum())
-        print(f"    [grey zone] Pushed UP   (+0.05): {moved_up:,} cards")
-        print(f"    [grey zone] Pushed DOWN (-0.05): {moved_down:,} cards")
-
-    return np.clip(final_scores, 0.0, 1.0).astype(np.float32), grey_model
+    
+    final_scores_cons = base_scores_cons.copy().astype(np.float64)
+    final_grey_model = None
+    
+    # 4. Применение рефайнера к финальной серой зоне
+    if len(avail) > 0 and y_grey_train.sum() > 0 and (y_grey_train == 0).sum() > 0:
+        final_grey_model = train_grey_zone_model(X_grey_train, y_grey_train, random_state)
+        
+        mask_grey = (base_scores_cons >= GREY_ZONE_LOW) & (base_scores_cons <= GREY_ZONE_HIGH)
+        if mask_grey.sum() > 0:
+            X_grey_pred = X_cons_final.loc[mask_grey, avail]
+            grey_proba = final_grey_model.predict_proba(X_grey_pred)[:, 1]
+            
+            final_scores_cons[mask_grey] = (0.45 * base_scores_cons[mask_grey]) + (0.55 * grey_proba)
+            
+    return np.clip(final_scores_cons, 0.0, 1.0).astype(np.float32), final_grey_model
