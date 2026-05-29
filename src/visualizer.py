@@ -3,138 +3,106 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 
-# Настройка шрифтов и общего стиля
-sns.set_theme(style="whitegrid")
-plt.rcParams["font.family"] = "DejaVu Sans"  # Для корректного отображения кириллицы
-plt.rcParams["text.color"] = "#231F20"        # Фирменный темный тон Mastercard для текста
-plt.rcParams["axes.labelcolor"] = "#231F20"
-
-# --- 1. ЦВЕТОВАЯ ПАЛИТРА MASTERCARD ---
-MC_RED = "#EB001B"
+# ── ТЁМНАЯ ТЕМА MASTERCARD ────────────────────────────────────────────────────
+BG        = "#0D0D0D"
+FG        = "#FFFFFF"
+MC_RED    = "#EB001B"
 MC_ORANGE = "#FF5F00"
 MC_YELLOW = "#F79E1B"
-MC_CHARCOAL = "#231F20"
-MC_LIGHT_BG = "#FFF2CC"  # Мягкий желтоватый фон для плашек
+MC_GOLD   = "#FFD700"
+GRID_COL  = "#2A2A2A"
 
-# --- 2. ПОДГОТОВКА ДАННЫХ ---
+plt.rcParams.update({
+    "figure.facecolor":  BG,
+    "axes.facecolor":    BG,
+    "axes.edgecolor":    FG,
+    "axes.labelcolor":   FG,
+    "axes.titlecolor":   FG,
+    "xtick.color":       FG,
+    "ytick.color":       FG,
+    "text.color":        FG,
+    "legend.facecolor":  "#1A1A1A",
+    "legend.edgecolor":  MC_ORANGE,
+    "legend.labelcolor": FG,
+    "grid.color":        GRID_COL,
+    "grid.linestyle":    "--",
+    "grid.alpha":        0.4,
+    "font.family":       "DejaVu Sans",
+    "savefig.facecolor": BG,
+    "savefig.edgecolor": "none",
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 TOTAL_CARDS = 80000
-
 categories = [
     "LOW\n(Genuine Consumer\nscore < 0.30)",
     "MEDIUM (Grey Zone)\n(Needs Investigation\n0.30 - 0.70)",
     "HIGH\n(Hidden Business\nscore >= 0.70)",
 ]
+counts_before = [71634, 6148, 2218]
+counts_after  = [75801, 333,  3866]
+pct_before = [c / TOTAL_CARDS * 100 for c in counts_before]
+pct_after  = [c / TOTAL_CARDS * 100 for c in counts_after]
 
-# Данные из ваших логов
-counts_before = [71634, 6148, 2218]  # До рефайнера
-counts_after = [75801, 333, 3866]    # После честного пайплайна
-
-pct_before = [count / TOTAL_CARDS * 100 for count in counts_before]
-pct_after = [count / TOTAL_CARDS * 100 for count in counts_after]
-
-# --- 3. ПОСТРОЕНИЕ ГРАФИКА ---
-x = np.arange(len(categories))
+x     = np.arange(len(categories))
 width = 0.35
 
-fig, ax = plt.subplots(figsize=(12, 7), facecolor="white")
-ax.set_facecolor("white")
+fig, ax = plt.subplots(figsize=(12, 7))
 
-# Столбцы в фирменных цветах
-rects1 = ax.bar(
-    x - width / 2,
-    pct_before,
-    width,
-    label="До серой зоны (Базовая модель)",
-    color=MC_ORANGE,
-    edgecolor=MC_CHARCOAL,
-    linewidth=0.8,
-    alpha=0.85
-)
-rects2 = ax.bar(
-    x + width / 2,
-    pct_after,
-    width,
-    label="После серой зоны (Composite Pipeline)",
-    color=MC_RED,
-    edgecolor=MC_CHARCOAL,
-    linewidth=0.8,
-    alpha=0.95
-)
+rects1 = ax.bar(x - width / 2, pct_before, width,
+                label="До серой зоны (Базовая модель)",
+                color=MC_ORANGE, edgecolor=MC_YELLOW, linewidth=0.8, alpha=0.9)
+rects2 = ax.bar(x + width / 2, pct_after, width,
+                label="После серой зоны (Composite Pipeline)",
+                color=MC_RED, edgecolor=MC_GOLD, linewidth=0.8, alpha=0.95)
 
-# --- 4. ОФОРМЛЕНИЕ ПОД СЛАЙДЫ ---
-ax.set_ylabel("Процент от общего пула карт (%)", fontsize=12, fontweight="bold", color=MC_CHARCOAL)
+ax.set_ylabel("Процент от общего пула карт (%)", fontsize=12,
+              fontweight="bold")
 ax.set_title(
     "Эффект очистки Серой Зоны (Grey Zone Refiner Utility)\n"
-    f"Распределение 80,000 карт Consumer Pool по уровням риска",
-    fontsize=14,
-    fontweight="bold",
-    pad=25,
-    color=MC_CHARCOAL,
+    f"Распределение {TOTAL_CARDS:,} карт Consumer Pool по уровням риска",
+    fontsize=14, fontweight="bold", color=MC_YELLOW
 )
 ax.set_xticks(x)
-ax.set_xticklabels(categories, fontsize=11, fontweight="bold", color=MC_CHARCOAL)
+ax.set_xticklabels(categories, fontsize=11, fontweight="bold")
 ax.set_ylim(0, 105)
+ax.legend(fontsize=11, loc="upper right")
+ax.grid(axis="y")
+ax.grid(axis="x", visible=False)
 
-# Легенда с кастомным оформлением
-ax.legend(fontsize=11, loc="upper right", frameon=True, facecolor="white", edgecolor=MC_CHARCOAL)
 
-# Сетка в тон
-ax.grid(axis='y', linestyle='--', alpha=0.5, color='#CBD5E1')
-ax.grid(axis='x', visible =False)
-
-# Функция для добавления точных бизнес-метрик над столбцами
-def autolabel(rects, absolute_counts):
+def autolabel(rects, counts, col):
     for idx, rect in enumerate(rects):
-        height = rect.get_height()
-        count = absolute_counts[idx]
-        label_text = f"{height:.2f}%\n({count:,} шт)"
-
+        h = rect.get_height()
         ax.annotate(
-            label_text,
-            xy=(rect.get_x() + rect.get_width() / 2, height),
-            xytext=(0, 6),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=9.5,
-            fontweight="bold",
-            color=MC_CHARCOAL
+            f"{h:.2f}%\n({counts[idx]:,} шт)",
+            xy=(rect.get_x() + rect.get_width() / 2, h),
+            xytext=(0, 6), textcoords="offset points",
+            ha="center", va="bottom",
+            fontsize=9.5, fontweight="bold", color=col
         )
 
-autolabel(rects1, counts_before)
-autolabel(rects2, counts_after)
 
-# Фирменная инфо-плашка (Business Impact)
+autolabel(rects1, counts_before, MC_YELLOW)
+autolabel(rects2, counts_after,  MC_GOLD)
+
 info_text = (
     "Бизнес-эффект решения:\n"
     f"• Серая зона сократилась в 18 раз (с ~6.1к до {counts_after[1]} карт)\n"
-    f"• Дополнительно выявлено +1,648 скрытых бизнесов (High Risk)\n"
-    "• 94.7% пула успешно верифицированы как легитимные"
+    f"• Дополнительно выявлено +1,648 скрытых бизнесов\n"
+    "• 94.7% пула верифицированы как легитимные"
 )
-props = dict(boxstyle="round,pad=0.6", facecolor=MC_LIGHT_BG, edgecolor=MC_YELLOW, alpha=0.9)
-ax.text(
-    1.45,
-    55,
-    info_text,
-    fontsize=11,
-    bbox=props,
-    verticalalignment="top",
-    fontweight="bold",
-    color=MC_CHARCOAL
-)
+props = dict(boxstyle="round,pad=0.6", facecolor="#1A0000",
+             edgecolor=MC_ORANGE, alpha=0.95)
+ax.text(1.45, 55, info_text, fontsize=11, bbox=props,
+        verticalalignment="top", fontweight="bold", color=MC_YELLOW)
 
-# Убираем лишние границы графика для современного вида
 sns.despine(left=True, bottom=True)
-
 plt.tight_layout()
 
-# Сохранение
-project_root = os.getcwd() 
-output_dir = os.path.join(project_root, "outputs", "figures")
-
+output_dir = os.path.join(os.getcwd(), "outputs", "figures")
 os.makedirs(output_dir, exist_ok=True)
 output_path = os.path.join(output_dir, "09_grey_zone_mastercard_style.png")
-plt.savefig(output_path, dpi=300, facecolor=fig.get_facecolor(), edgecolor='none')
+plt.savefig(output_path, dpi=300)
 plt.close()
-
-print(f"Презентационный график сохранен: {output_path}")
+print(f"График сохранён: {output_path}")

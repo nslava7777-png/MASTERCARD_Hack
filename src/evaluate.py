@@ -11,6 +11,37 @@ from sklearn.metrics import (
     roc_auc_score, roc_curve,
 )
 
+# ── ТЁМНАЯ ТЕМА MASTERCARD ────────────────────────────────────────────────────
+BG        = "#0D0D0D"
+FG        = "#FFFFFF"
+MC_RED    = "#EB001B"
+MC_ORANGE = "#FF5F00"
+MC_YELLOW = "#F79E1B"
+MC_GOLD   = "#FFD700"
+GRID_COL  = "#2A2A2A"
+PALETTE   = [MC_RED, MC_ORANGE, MC_YELLOW, MC_GOLD, "#FF8C00", "#DC143C"]
+
+plt.rcParams.update({
+    "figure.facecolor":  BG,
+    "axes.facecolor":    BG,
+    "axes.edgecolor":    FG,
+    "axes.labelcolor":   FG,
+    "axes.titlecolor":   FG,
+    "xtick.color":       FG,
+    "ytick.color":       FG,
+    "text.color":        FG,
+    "legend.facecolor":  "#1A1A1A",
+    "legend.edgecolor":  MC_ORANGE,
+    "legend.labelcolor": FG,
+    "grid.color":        GRID_COL,
+    "grid.linestyle":    "--",
+    "grid.alpha":        0.4,
+    "font.family":       "DejaVu Sans",
+    "savefig.facecolor": BG,
+    "savefig.edgecolor": "none",
+})
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def calculate_metrics(y_true, y_pred, y_score):
     has_both = len(np.unique(y_true)) > 1
@@ -37,55 +68,88 @@ def make_curve_payloads(y_true, proba_by_model):
 
 
 def plot_confusion_matrix(y_true, y_pred, path, title):
+    import matplotlib.colors as mcolors
     cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "mc", ["#1a0000", MC_RED, MC_ORANGE, MC_YELLOW])
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap=cmap, ax=ax,
                 xticklabels=["Consumer", "Business"],
-                yticklabels=["Consumer", "Business"])
-    plt.title(title)
-    plt.xlabel("Predicted"); plt.ylabel("Actual")
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+                yticklabels=["Consumer", "Business"],
+                linecolor=BG, linewidths=0.5,
+                annot_kws={"color": FG, "fontweight": "bold"})
+    ax.set_title(title, color=MC_YELLOW, fontweight="bold")
+    ax.set_xlabel("Predicted", color=FG)
+    ax.set_ylabel("Actual", color=FG)
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_score_distribution(scores_dict, path, title, log_scale=True):
-    plt.figure(figsize=(10, 5))
-    colors = ["steelblue", "darkorange", "green", "red"]
+    colors = [MC_RED, MC_ORANGE, MC_YELLOW, MC_GOLD]
+    fig, ax = plt.subplots(figsize=(10, 5))
     for (label, scores), color in zip(scores_dict.items(), colors):
-        plt.hist(scores, bins=60, alpha=0.65, label=label,
-                 color=color, log=log_scale, density=True)
-    plt.title(title); plt.xlabel("Score"); plt.legend()
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+        ax.hist(scores, bins=60, alpha=0.75, label=label,
+                color=color, log=log_scale, density=True)
+    ax.set_title(title, color=MC_YELLOW, fontweight="bold")
+    ax.set_xlabel("Score")
+    ax.legend()
+    ax.grid(axis="y")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_roc_curves(roc_data, path):
-    plt.figure(figsize=(7, 6))
-    for name, d in roc_data.items():
-        plt.plot(d["fpr"], d["tpr"], label=f"{name}  AUC={d['auc']:.4f}")
-    plt.plot([0, 1], [0, 1], "--", color="gray")
-    plt.xlabel("FPR"); plt.ylabel("TPR")
-    plt.title("ROC Curves — OOF"); plt.legend()
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+    colors = [MC_RED, MC_ORANGE, MC_YELLOW, MC_GOLD]
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for (name, d), color in zip(roc_data.items(), colors):
+        ax.plot(d["fpr"], d["tpr"], color=color, lw=2,
+                label=f"{name}  AUC={d['auc']:.4f}")
+    ax.plot([0, 1], [0, 1], "--", color="#444444", lw=1)
+    ax.set_xlabel("FPR")
+    ax.set_ylabel("TPR")
+    ax.set_title("ROC Curves — OOF", color=MC_YELLOW, fontweight="bold")
+    ax.legend()
+    ax.grid()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_precision_recall_curves(pr_data, path):
-    plt.figure(figsize=(7, 6))
-    for name, d in pr_data.items():
-        plt.plot(d["recall"], d["precision"],
-                 label=f"{name}  AP={d['ap']:.4f}")
-    plt.xlabel("Recall"); plt.ylabel("Precision")
-    plt.title("Precision-Recall Curves — OOF"); plt.legend()
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+    colors = [MC_RED, MC_ORANGE, MC_YELLOW, MC_GOLD]
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for (name, d), color in zip(pr_data.items(), colors):
+        ax.plot(d["recall"], d["precision"], color=color, lw=2,
+                label=f"{name}  AP={d['ap']:.4f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curves — OOF", color=MC_YELLOW, fontweight="bold")
+    ax.legend()
+    ax.grid()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_feature_importance(fi, path, top_n=25):
+    import matplotlib.colors as mcolors
     fi = fi.sort_values("importance", ascending=False).head(top_n)
-    colors = plt.cm.viridis_r(np.linspace(0.2, 0.85, len(fi)))
-    plt.figure(figsize=(10, max(5, top_n * 0.30)))
-    plt.barh(fi["feature"], fi["importance"], color=colors)
-    plt.gca().invert_yaxis()
-    plt.title(f"Top-{top_n} Feature Importances")
-    plt.xlabel("Importance")
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+    cmap = mcolors.LinearSegmentedColormap.from_list(
+        "mc_bar", [MC_RED, MC_ORANGE, MC_YELLOW])
+    colors = cmap(np.linspace(0, 1, len(fi)))
+    fig, ax = plt.subplots(figsize=(10, max(5, top_n * 0.30)))
+    ax.barh(fi["feature"], fi["importance"], color=colors)
+    ax.invert_yaxis()
+    ax.set_title(f"Top-{top_n} Feature Importances",
+                 color=MC_YELLOW, fontweight="bold")
+    ax.set_xlabel("Importance")
+    ax.grid(axis="x")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_grey_zone_analysis(ensemble_scores, final_scores,
@@ -97,56 +161,63 @@ def plot_grey_zone_analysis(ensemble_scores, final_scores,
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
         f"Grey Zone Refiner Analysis  [{grey_low}, {grey_high}]  n={mask.sum():,}",
-        fontsize=13, fontweight="bold",
+        fontsize=13, fontweight="bold", color=MC_YELLOW,
     )
 
-    axes[0].hist(before, bins=40, color="steelblue", alpha=0.8)
-    axes[0].set_title("Before refiner (ensemble_score)")
+    axes[0].hist(before, bins=40, color=MC_ORANGE, alpha=0.85)
+    axes[0].set_title("Before refiner (ensemble_score)", color=FG)
     axes[0].set_xlabel("Score")
-    axes[0].axvline(0.5, color="red", ls="--", lw=1.5)
+    axes[0].axvline(0.5, color=MC_RED, ls="--", lw=1.5)
 
-    axes[1].hist(after, bins=40, color="darkorange", alpha=0.8)
-    axes[1].set_title("After refiner (final_score)")
+    axes[1].hist(after, bins=40, color=MC_RED, alpha=0.85)
+    axes[1].set_title("After refiner (final_score)", color=FG)
     axes[1].set_xlabel("Score")
-    axes[1].axvline(0.5, color="red", ls="--", lw=1.5)
+    axes[1].axvline(0.5, color=MC_YELLOW, ls="--", lw=1.5)
 
     delta = after - before
-    axes[2].hist(delta, bins=40, color="green", alpha=0.8)
-    axes[2].set_title("Score delta (after - before)")
+    axes[2].hist(delta, bins=40, color=MC_GOLD, alpha=0.85)
+    axes[2].set_title("Score delta (after - before)", color=FG)
     axes[2].set_xlabel("Delta Score")
-    axes[2].axvline(0, color="red", ls="--", lw=1.5)
+    axes[2].axvline(0, color=MC_RED, ls="--", lw=1.5)
     moved_up   = int((delta >  0.05).sum())
     moved_down = int((delta < -0.05).sum())
     axes[2].text(
         0.05, 0.92,
         f"UP   (+0.05): {moved_up:,} cards\nDOWN (-0.05): {moved_down:,} cards",
         transform=axes[2].transAxes, fontsize=9, va="top",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        bbox=dict(boxstyle="round", facecolor="#1A0000",
+                  edgecolor=MC_ORANGE, alpha=0.9),
+        color=MC_YELLOW,
     )
 
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_consumer_score_breakdown(base_scores, dist_scores,
                                    iso_scores, final_scores, path):
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
     fig.suptitle("Consumer Card Score Components",
-                 fontsize=14, fontweight="bold")
+                 fontsize=14, fontweight="bold", color=MC_YELLOW)
     panels = [
-        (base_scores,  "Base model P(biz) [diagnostic]", "steelblue"),
-        (dist_scores,  "Distance score (centroid)",       "darkorange"),
-        (iso_scores,   "Isolation Forest anomaly",        "green"),
-        (final_scores, "Final score (ensemble + grey refiner)", "crimson"),
+        (base_scores,  "Base model P(biz) [diagnostic]",      MC_ORANGE),
+        (dist_scores,  "Distance score (centroid)",            MC_RED),
+        (iso_scores,   "Isolation Forest anomaly",             MC_GOLD),
+        (final_scores, "Final score (ensemble + grey refiner)", "#FF2244"),
     ]
     for ax, (scores, title, color) in zip(axes.ravel(), panels):
-        ax.hist(scores, bins=60, color=color, alpha=0.8, log=True)
-        ax.set_title(title, fontsize=10); ax.set_xlabel("Score")
+        ax.hist(scores, bins=60, color=color, alpha=0.85, log=True)
+        ax.set_title(title, fontsize=10, color=FG)
+        ax.set_xlabel("Score")
         p95 = float(np.percentile(scores, 95))
         p99 = float(np.percentile(scores, 99))
-        ax.axvline(p95, color="black", ls="--", lw=1.2, label=f"p95={p95:.3f}")
-        ax.axvline(p99, color="gray",  ls=":",  lw=1.2, label=f"p99={p99:.3f}")
+        ax.axvline(p95, color=MC_YELLOW, ls="--", lw=1.2, label=f"p95={p95:.3f}")
+        ax.axvline(p99, color=FG,        ls=":",  lw=1.2, label=f"p99={p99:.3f}")
         ax.legend(fontsize=8)
-    plt.tight_layout(); plt.savefig(path, dpi=160); plt.close()
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def plot_top_suspicious_cards(card_ids, scores, path, top_n=50):
@@ -154,22 +225,26 @@ def plot_top_suspicious_cards(card_ids, scores, path, top_n=50):
             .sort_values("score", ascending=False)
             .head(top_n))
     colors = [
-        "crimson"     if s >= 0.70 else
-        "darkorange"  if s >= 0.50 else
-        "steelblue"
+        MC_RED    if s >= 0.70 else
+        MC_ORANGE if s >= 0.50 else
+        MC_YELLOW
         for s in df["score"]
     ]
-    plt.figure(figsize=(13, max(7, top_n * 0.24)))
-    plt.barh(range(len(df)), df["score"], color=colors)
-    plt.yticks(range(len(df)),
-               [f"...{str(c)[-8:]}" for c in df["card"]], fontsize=7)
-    plt.gca().invert_yaxis()
-    plt.axvline(0.50, color="black", ls="--", lw=1.2, label="0.50")
-    plt.axvline(0.70, color="red",   ls=":",  lw=1.2, label="0.70 HIGH")
-    plt.xlabel("Final Score")
-    plt.title(f"Top-{top_n} Suspected Hidden Businesses")
-    plt.legend(); plt.tight_layout()
-    plt.savefig(path, dpi=160); plt.close()
+    fig, ax = plt.subplots(figsize=(13, max(7, top_n * 0.24)))
+    ax.barh(range(len(df)), df["score"], color=colors)
+    ax.set_yticks(range(len(df)))
+    ax.set_yticklabels([f"...{str(c)[-8:]}" for c in df["card"]], fontsize=7)
+    ax.invert_yaxis()
+    ax.axvline(0.50, color=MC_YELLOW, ls="--", lw=1.2, label="0.50")
+    ax.axvline(0.70, color=MC_RED,    ls=":",  lw=1.5, label="0.70 HIGH")
+    ax.set_xlabel("Final Score")
+    ax.set_title(f"Top-{top_n} Suspected Hidden Businesses",
+                 color=MC_YELLOW, fontweight="bold")
+    ax.legend()
+    ax.grid(axis="x")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
 
 
 def save_predictions(card_ids, scores, path, grey_low=0.30, high_thresh=0.70):
